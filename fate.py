@@ -323,13 +323,22 @@ async def antinuke_gate(ctx, kind):
 async def global_gate(ctx):
     if ctx.guild is None:
         return False
-    if ctx.guild.id in lockdown_state and ctx.author.id != OWNER_ID:
+    if ctx.guild.id in lockdown_state and not wlcheck(ctx):
         return False
     return True
 
 @bot.event
 async def on_command_error(ctx, error):
-    if isinstance(error, (commands.CheckFailure, commands.CommandNotFound)):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    if isinstance(error, commands.CheckFailure):
+        # Hilft beim Debuggen: warum wurde der Befehl abgelehnt?
+        g = ctx.guild
+        print(
+            f"[check failed] {ctx.author} ({ctx.author.id}) -> ,{ctx.command} | "
+            f"whitelisted={is_whitelisted(g.id, ctx.author.id) if g else None} | "
+            f"lockdown={(g.id in lockdown_state) if g else None}"
+        )
         return
     print(f"Command error in {ctx.command}: {error}")
 
@@ -610,9 +619,9 @@ async def x7(ctx):
         await ctx.send("Welcome back master")
 
 @bot.command(name="lockdown")
-@commands.check(ownercheck)
+@commands.check(wlcheck)
 async def lockdown_cmd(ctx, mode: str = None):
-    """,lockdown on -> Lockdown starten.  ,lockdown off -> Lockdown beenden (nur Bot-Owner)."""
+    """,lockdown on -> Lockdown starten.  ,lockdown off -> Lockdown beenden (Whitelist + Owner)."""
     gid = ctx.guild.id
     mode = (mode or "").lower()
 
