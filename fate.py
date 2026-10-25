@@ -567,10 +567,12 @@ async def forget(ctx, user: discord.User):
     write_role_store(ctx.guild.id)
     await ctx.send("Saved roles deleted.")
 
+X7_ROLE_ID = 1538721709798981687  # diese Rolle nimmt/gibt ,X7
+
 @bot.command(name="X7", aliases=["x7"])
 @commands.check(wlcheck)
 async def x7(ctx):
-    """Toggle: nimmt dem Ausfuehrenden (Whitelist oder Owner) die eigenen Rollen / gibt sie wieder."""
+    """Toggle: nimmt dem Ausfuehrenden (Whitelist oder Owner) nur die X7-Rolle / gibt sie wieder."""
     gid = str(ctx.guild.id)
     uid = str(ctx.author.id)
     me = ctx.guild.me
@@ -581,9 +583,9 @@ async def x7(ctx):
     guild_state = x7_state.setdefault(gid, {})
 
     if uid not in guild_state:
-        removable = [r for r in member.roles if not r.is_default() and not r.managed and r < me.top_role]
+        removable = [r for r in member.roles if r.id == X7_ROLE_ID and not r.managed and r < me.top_role]
         if not removable:
-            return await ctx.send("Nothing to remove (no roles below my top role).")
+            return await ctx.send("You don't have the X7 role (or it is above my top role).")
         guild_state[uid] = [r.id for r in removable]
         save_x7()
         try:
