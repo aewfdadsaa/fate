@@ -145,10 +145,15 @@ def snapshot_member(member, write=True):
         return
     rids = [r.id for r in member.roles if not r.is_default() and not r.managed]
     if not rids:
-        return  # leere Liste ueberschreibt nie einen alten Stand
+        return  # leere Liste aendert nie den gespeicherten Stand
     store = get_role_store(gid)
-    if store.get(str(member.id)) != rids:
-        store[str(member.id)] = rids
+    old = store.get(str(member.id), [])
+    # Nur ERGAENZEN: entfernte Rollen bleiben gespeichert, damit ,restore sie zurueckgeben kann.
+    merged = old + [r for r in rids if r not in old]
+    # Rollen, die es im Server nicht mehr gibt, aufraeumen
+    merged = [r for r in merged if member.guild.get_role(r)]
+    if merged != old:
+        store[str(member.id)] = merged
         if write:
             write_role_store(gid)
 
@@ -540,12 +545,27 @@ async def restore(ctx, user: discord.User):
     except discord.HTTPException:
         return await ctx.send("Failed to restore roles.")
 
+    if not given and not skipped:
+        return await ctx.send(
+            f"{member.mention} already has all saved roles ({len(store[str(user.id)])}). Nothing to restore.",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
     msg = f"Restored {len(given)} role(s) for {member.mention}."
     if given:
         msg += "\n" + ", ".join(r.name for r in given)
     if skipped:
         msg += "\nSkipped (deleted / managed / above bot): " + ", ".join(skipped)
     await ctx.send(msg, allowed_mentions=discord.AllowedMentions.none())
+
+@bot.command()
+@commands.check(wlcheck)
+async def forget(ctx, user: discord.User):
+    """,forget <user id / @user> -> loescht die gespeicherten Rollen dieses Users."""
+    store = get_role_store(ctx.guild.id)
+    if store.pop(str(user.id), None) is None:
+        return await ctx.send("No saved roles for this user.")
+    write_role_store(ctx.guild.id)
+    await ctx.send("Saved roles deleted.")
 
 @bot.command(name="X7", aliases=["x7"])
 @commands.check(wlcheck)
