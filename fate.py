@@ -2,7 +2,11 @@ import discord
 from discord.ext import commands
 from discord.utils import get
 import os
-from datetime import timedelta, datetime
+import json
+import time
+import asyncio
+import random
+from datetime import timedelta, datetime, timezone
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix=",", intents=intents)
@@ -10,10 +14,38 @@ bot = commands.Bot(command_prefix=",", intents=intents)
 OWNER_ID = 1477802548189593864
 AUTO_ROLE_NAME = "1538730480466141335"
 
+# =========================
+# EINSTELLUNGEN (ANTINUKE)
+# =========================
+
+MAX_BANS_PER_DAY = 5        # jeder ausser OWNER_ID darf max. so viele Bans / 24h
+MAX_KICKS_PER_DAY = 5       # dasselbe fuer Kicks
+MAX_DELETES_PER_MIN = 3     # max. geloeschte Channels/Rollen pro 60 Sek.
+PING_LIMIT = 3              # so viele @everyone/@here hintereinander loesen aus
+PING_WINDOW = 60            # ...innerhalb dieser Sekunden
+KICK_UNKNOWN_BOTS = True    # Bots, die nicht vom OWNER_ID hinzugefuegt wurden, werden gekickt
+AUTO_RESTORE_ON_JOIN = True # Rollen automatisch zurueckgeben wenn jemand neu joint
+
 whitelists = {}
 snapped = {}
 os.makedirs("whitelists", exist_ok=True)
 os.makedirs("autoroles", exist_ok=True)
+os.makedirs("saved_roles", exist_ok=True)
+
+# =========================
+# JSON HELFER
+# =========================
+
+def jload(path, default):
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return default
+
+def jsave(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f)
 
 # =========================
 # WHITELIST CHECK
@@ -47,6 +79,9 @@ def wlcheck(ctx):
     if ctx.author.id == OWNER_ID:
         return True
     return is_whitelisted(ctx.guild.id, ctx.author.id)
+
+def ownercheck(ctx):
+    return ctx.author.id == OWNER_ID
 
 # =========================
 # AUTOROLE SYSTEM
@@ -88,26 +123,317 @@ if load_verify_channel() is None:
     save_verify_channel(1539260969019248690)
 
 # =========================
+# ROLLEN-SPEICHER (fuer ,restore)
+# =========================
+
+role_store = {}  # guild_id -> {str(user_id): [role_ids]}
+
+def get_role_store(guild_id):
+    if guild_id not in role_store:
+        role_store[guild_id] = jload(f"saved_roles/{guild_id}.json", {})
+    return role_store[guild_id]
+
+def write_role_store(guild_id):
+    jsave(f"saved_roles/{guild_id}.json", get_role_store(guild_id))
+
+def snapshot_member(member, write=True):
+    """Speichert die aktuellen Rollen eines Members (nicht waehrend Lockdown / X7)."""
+    gid = member.guild.id
+    if member.bot or gid in lockdown_state:
+        return
+    if str(member.id) in x7_state.get(str(gid), {}):
+        return
+    rids = [r.id for r in member.roles if not r.is_default() and not r.managed]
+    if not rids:
+        return  # leere Liste ueberschreibt nie einen alten Stand
+    store = get_role_store(gid)
+    if store.get(str(member.id)) != rids:
+        store[str(member.id)] = rids
+        if write:
+            write_role_store(gid)
+
+async def restore_roles(member):
+    """Gibt gespeicherte Rollen zurueck. Gibt (given, skipped) zurueck."""
+    guild = member.guild
+    me = guild.me
+    rids = get_role_store(guild.id).get(str(member.id), [])
+    given, skipped = [], []
+    for rid in rids:
+        r = guild.get_role(rid)
+        if r is None:
+            skipped.append(f"deleted role ({rid})")
+        elif r.managed or r >= me.top_role:
+            skipped.append(r.name)
+        elif r not in member.roles:
+            given.append(r)
+    if given:
+        await member.add_roles(*given, reason="restore")
+    return given, skipped
+
+@bot.event
+async def on_member_update(before, after):
+    if before.roles != after.roles:
+        snapshot_member(after)
+
+# =========================
+# LOCKDOWN / X7 STATUS
+# =========================
+
+LOCKDOWN_FILE = "lockdown.json"
+X7_FILE = "x7.json"
+
+# guild_id (int) -> {"channel": id, "roles": {str(user_id): [role_ids]}}
+lockdown_state = {int(k): v for k, v in jload(LOCKDOWN_FILE, {}).items()}
+# str(guild_id) -> {str(user_id): [role_ids]}
+x7_state = jload(X7_FILE, {})
+
+def save_lockdown():
+    jsave(LOCKDOWN_FILE, {str(k): v for k, v in lockdown_state.items()})
+
+def save_x7():
+    jsave(X7_FILE, x7_state)
+
+# =========================
+# ANTINUKE KERN
+# =========================
+
+LOG_CHANNEL_ID = 1539479412775452713
+ACTION_LOG_FILE = "actionlog.json"
+action_log = jload(ACTION_LOG_FILE, {})  # "guild:user:kind" -> [timestamps]
+
+def register_action(guild_id, user_id, kind, window):
+    """Zaehlt eine Aktion und gibt zurueck wie oft sie im Zeitfenster passiert ist."""
+    key = f"{guild_id}:{user_id}:{kind}"
+    now = time.time()
+    lst = [t for t in action_log.get(key, []) if now - t < window]
+    lst.append(now)
+    action_log[key] = lst
+    jsave(ACTION_LOG_FILE, action_log)
+    return len(lst)
+
+async def send_log(guild, text):
+    ch = guild.get_channel(LOG_CHANNEL_ID)
+    if ch:
+        try:
+            await ch.send(text)
+        except discord.HTTPException:
+            pass
+
+async def start_lockdown(guild, reason="manual"):
+    gid = guild.id
+    if gid in lockdown_state:
+        return
+    # sofort markieren, damit parallele Trigger nicht doppelt laufen
+    lockdown_state[gid] = {"channel": None, "roles": {}}
+    save_lockdown()
+    me = guild.me
+
+    await send_log(guild, f"🚨 **ANTINUKE TRIGGERED** — {reason}\nLockdown started.")
+
+    # Lockdown-Channel: alle duerfen lesen, nur Bot + Owner duerfen schreiben
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False, add_reactions=False),
+        me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+    }
+    owner_member = guild.get_member(OWNER_ID)
+    if owner_member:
+        overwrites[owner_member] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+    try:
+        channel = await guild.create_text_channel("lockdown", overwrites=overwrites, reason="Antinuke lockdown")
+        lockdown_state[gid]["channel"] = channel.id
+        save_lockdown()
+        await channel.send("server is currently on lockdown")
+    except discord.HTTPException:
+        pass
+
+    # Rollen von allen entfernen (ausser Bots, Bot-Owner, Server-Owner)
+    count = 0
+    for member in list(guild.members):
+        if member.bot or member.id == OWNER_ID or member.id == guild.owner_id:
+            continue
+        removable = [r for r in member.roles if not r.is_default() and not r.managed and r < me.top_role]
+        if not removable:
+            continue
+        lockdown_state[gid]["roles"][str(member.id)] = [r.id for r in removable]
+        try:
+            await member.remove_roles(*removable, reason="Antinuke lockdown")
+            count += 1
+        except discord.HTTPException:
+            pass
+        if count % 20 == 0:
+            save_lockdown()
+        await asyncio.sleep(0.25)
+    save_lockdown()
+    await send_log(guild, f"🔒 Lockdown active — roles removed from {count} members.")
+
+async def end_lockdown(guild):
+    state = lockdown_state.get(guild.id)
+    if not state:
+        return None
+    me = guild.me
+    restored = 0
+    for uid, rids in state["roles"].items():
+        member = guild.get_member(int(uid))
+        if not member:
+            continue
+        roles = [guild.get_role(r) for r in rids]
+        roles = [r for r in roles if r and not r.managed and r < me.top_role and r not in member.roles]
+        if roles:
+            try:
+                await member.add_roles(*roles, reason="Lockdown lifted")
+                restored += 1
+            except discord.HTTPException:
+                pass
+            await asyncio.sleep(0.25)
+    channel = guild.get_channel(state.get("channel") or 0)
+    del lockdown_state[guild.id]
+    save_lockdown()
+    if channel:
+        try:
+            await channel.delete(reason="Lockdown lifted")
+        except discord.HTTPException:
+            pass
+    return restored
+
+async def trigger_antinuke(guild, reason):
+    if guild.id in lockdown_state:
+        return
+    await start_lockdown(guild, reason)
+
+async def antinuke_gate(ctx, kind):
+    """True = Aktion erlaubt. Zaehlt Bans/Kicks die ueber Bot-Befehle laufen."""
+    if ctx.author.id == OWNER_ID:
+        return True
+    limit = MAX_BANS_PER_DAY if kind == "ban" else MAX_KICKS_PER_DAY
+    count = register_action(ctx.guild.id, ctx.author.id, kind, 86400)
+    if count > limit:
+        await trigger_antinuke(ctx.guild, f"{ctx.author} ({ctx.author.id}) exceeded {limit} {kind}s / 24h (via bot command)")
+        return False
+    return True
+
+# Globaler Check: waehrend Lockdown darf nur der Owner Befehle nutzen
+@bot.check
+async def global_gate(ctx):
+    if ctx.guild is None:
+        return False
+    if ctx.guild.id in lockdown_state and ctx.author.id != OWNER_ID:
+        return False
+    return True
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, (commands.CheckFailure, commands.CommandNotFound)):
+        return
+    print(f"Command error in {ctx.command}: {error}")
+
+# --- Audit-Log basierter Schutz (Bans/Kicks/Loeschungen/Bots) ---
+
+@bot.event
+async def on_audit_log_entry_create(entry):
+    guild = entry.guild
+    executor = entry.user
+    if executor is None or executor.id in (OWNER_ID, bot.user.id):
+        return
+    if guild.id in lockdown_state:
+        return
+
+    action = entry.action
+    target_id = getattr(entry.target, "id", None)
+
+    if action in (discord.AuditLogAction.ban, discord.AuditLogAction.kick):
+        kind = "ban" if action == discord.AuditLogAction.ban else "kick"
+        limit = MAX_BANS_PER_DAY if kind == "ban" else MAX_KICKS_PER_DAY
+        count = register_action(guild.id, executor.id, kind, 86400)
+        if count > limit:
+            if kind == "ban" and target_id:
+                try:
+                    await guild.unban(discord.Object(id=target_id), reason="Antinuke: revert excess ban")
+                except discord.HTTPException:
+                    pass
+            await trigger_antinuke(guild, f"{executor} ({executor.id}) exceeded {limit} {kind}s / 24h")
+
+    elif action in (discord.AuditLogAction.channel_delete, discord.AuditLogAction.role_delete):
+        count = register_action(guild.id, executor.id, "delete", 60)
+        if count > MAX_DELETES_PER_MIN:
+            await trigger_antinuke(guild, f"{executor} ({executor.id}) deleted more than {MAX_DELETES_PER_MIN} channels/roles within 60s")
+
+    elif action == discord.AuditLogAction.bot_add and KICK_UNKNOWN_BOTS:
+        if target_id:
+            try:
+                await guild.kick(discord.Object(id=target_id), reason="Antinuke: bot added by non-owner")
+                await send_log(guild, f"🤖 Kicked bot `{target_id}` — added by {executor} ({executor.id}).")
+            except discord.HTTPException:
+                pass
+
+# --- @everyone / @here Spam ---
+
+ping_tracker = {}  # channel_id -> [(timestamp, message)]
+
+@bot.event
+async def on_message(message):
+    if (
+        message.guild
+        and message.author.id not in (OWNER_ID, bot.user.id)
+        and message.guild.id not in lockdown_state
+    ):
+        content = message.content or ""
+        cid = message.channel.id
+        if "@everyone" in content or "@here" in content:
+            now = time.time()
+            lst = [x for x in ping_tracker.get(cid, []) if now - x[0] < PING_WINDOW]
+            lst.append((now, message))
+            ping_tracker[cid] = lst
+            if len(lst) >= PING_LIMIT:
+                ping_tracker[cid] = []
+                for _, m in lst:
+                    try:
+                        await m.delete()
+                    except discord.HTTPException:
+                        pass
+                await trigger_antinuke(message.guild, f"{PING_LIMIT}x @everyone/@here in a row in #{message.channel}")
+        else:
+            ping_tracker.pop(cid, None)
+    await bot.process_commands(message)
+
+# =========================
+# READY (Rollen-Snapshot)
+# =========================
+
+@bot.event
+async def on_ready():
+    for guild in bot.guilds:
+        for m in guild.members:
+            snapshot_member(m, write=False)
+        write_role_store(guild.id)
+    print(f"Logged in as {bot.user}")
+
+# =========================
 # WELCOME SYSTEM (JOIN + LEAVE LOGS)
 # =========================
 
 COMMANDER_ROLE_ID = 1538721709798981687
-LOG_CHANNEL_ID = 1539479412775452713
 
 @bot.event
 async def on_member_join(member):
-    role_id = load_autorole(member.guild.id)
-    role = None
-    if role_id:
-        role = member.guild.get_role(role_id)
-    if not role:
-        role = get(member.guild.roles, name=AUTO_ROLE_NAME)
-    if role:
-        await member.add_roles(role)
+    if member.guild.id not in lockdown_state:
+        role_id = load_autorole(member.guild.id)
+        role = None
+        if role_id:
+            role = member.guild.get_role(role_id)
+        if not role:
+            role = get(member.guild.roles, name=AUTO_ROLE_NAME)
+        if role:
+            try:
+                await member.add_roles(role)
+            except discord.HTTPException:
+                pass
+        if AUTO_RESTORE_ON_JOIN and not member.bot:
+            try:
+                await restore_roles(member)
+            except discord.HTTPException:
+                pass
 
-    # 🔥 FIX: Immer den Channel nehmen, der "verify" heißt
     verify_channel = discord.utils.get(member.guild.channels, name="verify")
-
     commander_role = member.guild.get_role(COMMANDER_ROLE_ID)
 
     if verify_channel and commander_role:
@@ -117,9 +443,10 @@ async def on_member_join(member):
 
     log_channel = member.guild.get_channel(LOG_CHANNEL_ID)
     if log_channel:
+        now = datetime.now(timezone.utc)
         created = member.created_at.strftime("%Y-%m-%d %H:%M:%S")
-        age_days = (datetime.utcnow() - member.created_at).days
-        join_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        age_days = (now - member.created_at).days
+        join_time = now.strftime("%Y-%m-%d %H:%M:%S")
 
         await log_channel.send(
             f"📥 **Join Log**\n"
@@ -132,11 +459,15 @@ async def on_member_join(member):
 
 @bot.event
 async def on_member_remove(member):
+    # Rollen merken (gilt auch bei Ban/Kick/Leave)
+    snapshot_member(member)
+
     log_channel = member.guild.get_channel(LOG_CHANNEL_ID)
     if log_channel:
+        now = datetime.now(timezone.utc)
         created = member.created_at.strftime("%Y-%m-%d %H:%M:%S")
-        age_days = (datetime.utcnow() - member.created_at).days
-        leave_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        age_days = (now - member.created_at).days
+        leave_time = now.strftime("%Y-%m-%d %H:%M:%S")
 
         await log_channel.send(
             f"📤 **Goodbye, {member.name}! Hope to see you again soon...**\n"
@@ -185,6 +516,104 @@ async def wllist(ctx):
     else:
         users = [f"<@{uid}>" for uid in wl]
         await ctx.send("Whitelist:\n" + "\n".join(users))
+
+# =========================
+# NEUE COMMANDS: RESTORE / X7 / LOCKDOWN
+# =========================
+
+@bot.command()
+@commands.check(wlcheck)
+async def restore(ctx, user: discord.User):
+    """,restore <user id>  oder  ,restore @user"""
+    store = get_role_store(ctx.guild.id)
+    if str(user.id) not in store:
+        return await ctx.send("No saved roles for this user.")
+
+    member = ctx.guild.get_member(user.id)
+    if member is None:
+        if AUTO_RESTORE_ON_JOIN:
+            return await ctx.send("User is not in the server (banned? unban first). Roles are saved and will be given back when they join.")
+        return await ctx.send("User is not in the server (banned? unban first), then run the command again.")
+
+    try:
+        given, skipped = await restore_roles(member)
+    except discord.HTTPException:
+        return await ctx.send("Failed to restore roles.")
+
+    msg = f"Restored {len(given)} role(s) for {member.mention}."
+    if given:
+        msg += "\n" + ", ".join(r.name for r in given)
+    if skipped:
+        msg += "\nSkipped (deleted / managed / above bot): " + ", ".join(skipped)
+    await ctx.send(msg, allowed_mentions=discord.AllowedMentions.none())
+
+@bot.command(name="X7", aliases=["x7"])
+@commands.check(ownercheck)
+async def x7(ctx):
+    """Toggle: nimmt allen Whitelist-Ownern (+ dir) die Rollen / gibt sie wieder."""
+    gid = str(ctx.guild.id)
+    me = ctx.guild.me
+
+    if gid not in x7_state:
+        targets = set(load_whitelist(ctx.guild.id)) | {OWNER_ID}
+        saved = {}
+        failed = 0
+        for uid in targets:
+            member = ctx.guild.get_member(uid)
+            if not member:
+                continue
+            removable = [r for r in member.roles if not r.is_default() and not r.managed and r < me.top_role]
+            if not removable:
+                continue
+            saved[str(uid)] = [r.id for r in removable]
+            try:
+                await member.remove_roles(*removable, reason="X7")
+            except discord.HTTPException:
+                failed += 1
+        x7_state[gid] = saved
+        save_x7()
+        await ctx.send("Bye master")
+        if failed:
+            await ctx.send(f"({failed} user(s) could not be changed — check role hierarchy.)")
+    else:
+        saved = x7_state[gid]
+        failed = 0
+        for uid, rids in saved.items():
+            member = ctx.guild.get_member(int(uid))
+            if not member:
+                continue
+            roles = [ctx.guild.get_role(r) for r in rids]
+            roles = [r for r in roles if r and not r.managed and r < me.top_role and r not in member.roles]
+            if roles:
+                try:
+                    await member.add_roles(*roles, reason="X7 back")
+                except discord.HTTPException:
+                    failed += 1
+        del x7_state[gid]
+        save_x7()
+        await ctx.send("Welcome back master")
+        if failed:
+            await ctx.send(f"({failed} user(s) could not be changed — check role hierarchy.)")
+
+@bot.command(name="lockdown")
+@commands.check(ownercheck)
+async def lockdown_cmd(ctx, mode: str = None):
+    """,lockdown  -> Lockdown beenden (nur Bot-Owner).  ,lockdown on -> manuell starten."""
+    gid = ctx.guild.id
+    if mode and mode.lower() == "on":
+        if gid in lockdown_state:
+            return await ctx.send("Already on lockdown.")
+        return await start_lockdown(ctx.guild, f"manual by {ctx.author}")
+
+    if gid not in lockdown_state:
+        return await ctx.send("Server is not on lockdown. Use `,lockdown on` to start one.")
+
+    lock_channel_id = lockdown_state[gid].get("channel")
+    await ctx.send("Lifting lockdown and restoring roles...")
+    restored = await end_lockdown(ctx.guild)
+    if ctx.channel.id != lock_channel_id:
+        await ctx.send(f"Lockdown lifted. Roles restored for {restored} members.")
+    await send_log(ctx.guild, f"🔓 Lockdown lifted by {ctx.author}. Roles restored for {restored} members.")
 
 # =========================
 # MODERATION COMMANDS
@@ -308,12 +737,16 @@ async def untimeout(ctx, member: discord.Member):
 @bot.command()
 @commands.check(wlcheck)
 async def kick(ctx, member: discord.Member, *, reason=None):
+    if not await antinuke_gate(ctx, "kick"):
+        return
     await member.kick(reason=reason)
     await ctx.send(f"{member.mention} kicked.")
 
 @bot.command()
 @commands.check(wlcheck)
 async def ban(ctx, member: discord.Member, *, reason=None):
+    if not await antinuke_gate(ctx, "ban"):
+        return
     await member.ban(reason=reason)
     await ctx.send(f"{member.mention} banned.")
 
@@ -329,9 +762,12 @@ async def unban(ctx, user: discord.User):
 @bot.command()
 @commands.check(wlcheck)
 async def unbanall(ctx):
-    bans = await ctx.guild.bans()
-    for entry in bans:
-        await ctx.guild.unban(entry.user)
+    # discord.py 2.x: bans() ist ein async iterator
+    async for entry in ctx.guild.bans(limit=None):
+        try:
+            await ctx.guild.unban(entry.user)
+        except discord.HTTPException:
+            pass
     await ctx.send("All users unbanned.")
 
 # =========================
@@ -343,6 +779,8 @@ SNAP_GIF = "https://tenor.com/view/salute-cat-cute-yessir-gif-372156263322475535
 @bot.command()
 @commands.check(wlcheck)
 async def snap(ctx, member: discord.Member):
+    if not await antinuke_gate(ctx, "ban"):
+        return
     await ctx.guild.ban(member, reason="snapped")
     s = snapped.setdefault(ctx.guild.id, set())
     s.add(member.id)
@@ -423,17 +861,17 @@ class NukeConfirm(View):
         if not old_channel:
             return await interaction.response.send_message("Channel not found.", ephemeral=True)
 
-        name = old_channel.name
-        category = old_channel.category
-        overwrites = old_channel.overwrites
+        old_position = old_channel.position
 
+        # clone behält Name, Kategorie, Rechte, Topic, Slowmode, NSFW
+        new_channel = await old_channel.clone(reason="nuke")
         await old_channel.delete()
 
-        new_channel = await self.ctx.guild.create_text_channel(
-            name=name,
-            category=category,
-            overwrites=overwrites
-        )
+        # Position des alten Channels wiederherstellen
+        try:
+            await new_channel.edit(position=old_position)
+        except discord.HTTPException:
+            pass
 
         save_verify_channel(new_channel.id)
 
@@ -470,18 +908,15 @@ async def nuke(ctx):
         view=view
     )
 
-    await discord.utils.sleep_until(datetime.utcnow() + timedelta(seconds=3))
+    await asyncio.sleep(3)
     try:
         await msg.delete()
     except:
-        pass 
+        pass
 
 # =========================
 # GIVEAWAY SYSTEM
 # =========================
-
-import asyncio
-import random
 
 last_gw_message = {}  # guild_id : message_id
 
@@ -489,7 +924,6 @@ last_gw_message = {}  # guild_id : message_id
 @commands.check(wlcheck)
 async def gw(ctx, item: str, time: str):
 
-    # 🔥 CHECK: Normal WL oder GW-WL müssen erlaubt sein
     if not (is_gw_whitelisted(ctx.guild.id, ctx.author.id) or is_whitelisted(ctx.guild.id, ctx.author.id)):
         return await ctx.send("You are not allowed to start giveaways.")
 
@@ -519,7 +953,7 @@ async def gw(ctx, item: str, time: str):
         ),
         color=discord.Color.gold()
     )
-    embed.set_footer(text=f"Started at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    embed.set_footer(text=f"Started at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
     msg = await ctx.send(embed=embed)
     await msg.add_reaction("🎉")
@@ -549,7 +983,6 @@ async def gw(ctx, item: str, time: str):
 @commands.check(wlcheck)
 async def gw_reroll(ctx):
 
-    # 🔥 CHECK: Normal WL oder GW-WL müssen erlaubt sein
     if not (is_gw_whitelisted(ctx.guild.id, ctx.author.id) or is_whitelisted(ctx.guild.id, ctx.author.id)):
         return await ctx.send("You are not allowed to reroll giveaways.")
 
@@ -613,10 +1046,9 @@ async def gw_wl(ctx, action: str, member: discord.Member):
         await ctx.send(
             "Invalid action.\n"
             "Use:\n"
-            "`-gw_wl add @user`\n"
-            "`-gw_wl remove @user`"
+            "`,gw_wl add @user`\n"
+            "`,gw_wl remove @user`"
         )
-
 
 
 bot.run(os.getenv("TOKEN"))
