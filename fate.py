@@ -237,7 +237,7 @@ async def start_lockdown(guild, reason="manual"):
 
     # Lockdown-Channel: alle duerfen lesen, nur Bot + Owner duerfen schreiben
     overwrites = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False, add_reactions=False),
+        guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=True),
         me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
     }
     owner_member = guild.get_member(OWNER_ID)
@@ -255,6 +255,8 @@ async def start_lockdown(guild, reason="manual"):
     count = 0
     for member in list(guild.members):
         if member.bot or member.id == OWNER_ID or member.id == guild.owner_id:
+            continue
+        if is_whitelisted(gid, member.id):
             continue
         removable = [r for r in member.roles if not r.is_default() and not r.managed and r < me.top_role]
         if not removable:
@@ -610,22 +612,27 @@ async def x7(ctx):
 @bot.command(name="lockdown")
 @commands.check(ownercheck)
 async def lockdown_cmd(ctx, mode: str = None):
-    """,lockdown  -> Lockdown beenden (nur Bot-Owner).  ,lockdown on -> manuell starten."""
+    """,lockdown on -> Lockdown starten.  ,lockdown off -> Lockdown beenden (nur Bot-Owner)."""
     gid = ctx.guild.id
-    if mode and mode.lower() == "on":
+    mode = (mode or "").lower()
+
+    if mode == "on":
         if gid in lockdown_state:
             return await ctx.send("Already on lockdown.")
         return await start_lockdown(ctx.guild, f"manual by {ctx.author}")
 
-    if gid not in lockdown_state:
-        return await ctx.send("Server is not on lockdown. Use `,lockdown on` to start one.")
+    if mode == "off":
+        if gid not in lockdown_state:
+            return await ctx.send("Server is not on lockdown.")
+        lock_channel_id = lockdown_state[gid].get("channel")
+        await ctx.send("Lifting lockdown and restoring roles...")
+        restored = await end_lockdown(ctx.guild)
+        if ctx.channel.id != lock_channel_id:
+            await ctx.send(f"Lockdown lifted. Roles restored for {restored} members.")
+        await send_log(ctx.guild, f"🔓 Lockdown lifted by {ctx.author}. Roles restored for {restored} members.")
+        return
 
-    lock_channel_id = lockdown_state[gid].get("channel")
-    await ctx.send("Lifting lockdown and restoring roles...")
-    restored = await end_lockdown(ctx.guild)
-    if ctx.channel.id != lock_channel_id:
-        await ctx.send(f"Lockdown lifted. Roles restored for {restored} members.")
-    await send_log(ctx.guild, f"🔓 Lockdown lifted by {ctx.author}. Roles restored for {restored} members.")
+    await ctx.send("Use `,lockdown on` or `,lockdown off`.")
 
 # =========================
 # MODERATION COMMANDS
