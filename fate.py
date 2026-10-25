@@ -12,7 +12,7 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix=",", intents=intents)
 
 OWNER_ID = 1477802548189593864
-AUTO_ROLE_NAME = "1538730480466141335"
+AUTO_ROLE_ID = 1538730480466141335  # Standard-Autorole (per ,autorole ueberschreibbar)
 
 # =========================
 # EINSTELLUNGEN (ANTINUKE)
@@ -432,17 +432,15 @@ COMMANDER_ROLE_ID = 1538721709798981687
 @bot.event
 async def on_member_join(member):
     if member.guild.id not in lockdown_state:
-        role_id = load_autorole(member.guild.id)
-        role = None
-        if role_id:
-            role = member.guild.get_role(role_id)
-        if not role:
-            role = get(member.guild.roles, name=AUTO_ROLE_NAME)
+        role_id = load_autorole(member.guild.id) or AUTO_ROLE_ID
+        role = member.guild.get_role(role_id) or member.guild.get_role(AUTO_ROLE_ID)
         if role:
             try:
-                await member.add_roles(role)
-            except discord.HTTPException:
-                pass
+                await member.add_roles(role, reason="autorole")
+            except discord.HTTPException as e:
+                print(f"[autorole] could not give {role.name} ({role.id}) to {member}: {e}")
+        else:
+            print(f"[autorole] role {role_id} not found in {member.guild.name}")
         if AUTO_RESTORE_ON_JOIN and not member.bot:
             try:
                 await restore_roles(member)
