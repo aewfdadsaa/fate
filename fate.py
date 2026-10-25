@@ -197,7 +197,7 @@ def save_x7():
 # ANTINUKE KERN
 # =========================
 
-LOG_CHANNEL_ID = 1539479412775452713
+LOG_CHANNEL_ID = 1553512690155130900
 ACTION_LOG_FILE = "actionlog.json"
 action_log = jload(ACTION_LOG_FILE, {})  # "guild:user:kind" -> [timestamps]
 
@@ -548,52 +548,42 @@ async def restore(ctx, user: discord.User):
     await ctx.send(msg, allowed_mentions=discord.AllowedMentions.none())
 
 @bot.command(name="X7", aliases=["x7"])
-@commands.check(ownercheck)
+@commands.check(wlcheck)
 async def x7(ctx):
-    """Toggle: nimmt allen Whitelist-Ownern (+ dir) die Rollen / gibt sie wieder."""
+    """Toggle: nimmt dem Ausfuehrenden (Whitelist oder Owner) die eigenen Rollen / gibt sie wieder."""
     gid = str(ctx.guild.id)
+    uid = str(ctx.author.id)
     me = ctx.guild.me
+    member = ctx.guild.get_member(ctx.author.id)
+    if member is None:
+        return
 
-    if gid not in x7_state:
-        targets = set(load_whitelist(ctx.guild.id)) | {OWNER_ID}
-        saved = {}
-        failed = 0
-        for uid in targets:
-            member = ctx.guild.get_member(uid)
-            if not member:
-                continue
-            removable = [r for r in member.roles if not r.is_default() and not r.managed and r < me.top_role]
-            if not removable:
-                continue
-            saved[str(uid)] = [r.id for r in removable]
-            try:
-                await member.remove_roles(*removable, reason="X7")
-            except discord.HTTPException:
-                failed += 1
-        x7_state[gid] = saved
+    guild_state = x7_state.setdefault(gid, {})
+
+    if uid not in guild_state:
+        removable = [r for r in member.roles if not r.is_default() and not r.managed and r < me.top_role]
+        if not removable:
+            return await ctx.send("Nothing to remove (no roles below my top role).")
+        guild_state[uid] = [r.id for r in removable]
         save_x7()
+        try:
+            await member.remove_roles(*removable, reason="X7")
+        except discord.HTTPException:
+            del guild_state[uid]
+            save_x7()
+            return await ctx.send("Failed to remove roles — check role hierarchy.")
         await ctx.send("Bye master")
-        if failed:
-            await ctx.send(f"({failed} user(s) could not be changed — check role hierarchy.)")
     else:
-        saved = x7_state[gid]
-        failed = 0
-        for uid, rids in saved.items():
-            member = ctx.guild.get_member(int(uid))
-            if not member:
-                continue
-            roles = [ctx.guild.get_role(r) for r in rids]
-            roles = [r for r in roles if r and not r.managed and r < me.top_role and r not in member.roles]
+        roles = [ctx.guild.get_role(r) for r in guild_state[uid]]
+        roles = [r for r in roles if r and not r.managed and r < me.top_role and r not in member.roles]
+        try:
             if roles:
-                try:
-                    await member.add_roles(*roles, reason="X7 back")
-                except discord.HTTPException:
-                    failed += 1
-        del x7_state[gid]
+                await member.add_roles(*roles, reason="X7 back")
+        except discord.HTTPException:
+            return await ctx.send("Failed to give roles back — check role hierarchy.")
+        del guild_state[uid]
         save_x7()
         await ctx.send("Welcome back master")
-        if failed:
-            await ctx.send(f"({failed} user(s) could not be changed — check role hierarchy.)")
 
 @bot.command(name="lockdown")
 @commands.check(ownercheck)
