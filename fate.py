@@ -387,6 +387,9 @@ async def on_audit_log_entry_create(entry):
             await trigger_antinuke(guild, f"{executor} ({executor.id}) exceeded {limit} {kind}s / 24h")
 
     elif action in (discord.AuditLogAction.channel_delete, discord.AuditLogAction.role_delete):
+        # Bots (z.B. VoiceMaster loescht leere Temp-VCs) zaehlen nicht mit
+        if executor.bot:
+            return
         count = register_action(guild.id, executor.id, "delete", 60)
         if count > MAX_DELETES_PER_MIN:
             await trigger_antinuke(guild, f"{executor} ({executor.id}) deleted more than {MAX_DELETES_PER_MIN} channels/roles within 60s")
