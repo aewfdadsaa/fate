@@ -177,6 +177,9 @@ async def restore_roles(member):
 
 @bot.event
 async def on_member_update(before, after):
+    # Rules-Screening: wenn der User die Regeln bestaetigt, bekommt er jetzt die Autorole
+    if before.pending and not after.pending:
+        await give_autorole(after)
     if before.roles != after.roles:
         snapshot_member(after)
 
@@ -429,18 +432,30 @@ async def on_ready():
 
 COMMANDER_ROLE_ID = 1538721709798981687
 
+async def give_autorole(member):
+    """Gibt die Autorole (ID oder per ,autorole gesetzt). Loggt in die Konsole, warum es nicht klappt."""
+    guild = member.guild
+    if guild.id in lockdown_state:
+        print(f"[autorole] skipped for {member}: lockdown is active (use ,lockdown off)")
+        return
+    role_id = load_autorole(guild.id) or AUTO_ROLE_ID
+    role = guild.get_role(role_id) or guild.get_role(AUTO_ROLE_ID)
+    if role is None:
+        print(f"[autorole] role {role_id} not found in {guild.name}")
+        return
+    if role in member.roles:
+        return
+    try:
+        await member.add_roles(role, reason="autorole")
+        print(f"[autorole] gave {role.name} to {member}")
+    except discord.HTTPException as e:
+        print(f"[autorole] could not give {role.name} ({role.id}) to {member}: {e}")
+
 @bot.event
 async def on_member_join(member):
+    print(f"[join] {member} ({member.id}) joined {member.guild.name} (pending={member.pending})")
+    await give_autorole(member)
     if member.guild.id not in lockdown_state:
-        role_id = load_autorole(member.guild.id) or AUTO_ROLE_ID
-        role = member.guild.get_role(role_id) or member.guild.get_role(AUTO_ROLE_ID)
-        if role:
-            try:
-                await member.add_roles(role, reason="autorole")
-            except discord.HTTPException as e:
-                print(f"[autorole] could not give {role.name} ({role.id}) to {member}: {e}")
-        else:
-            print(f"[autorole] role {role_id} not found in {member.guild.name}")
         if AUTO_RESTORE_ON_JOIN and not member.bot:
             try:
                 await restore_roles(member)
