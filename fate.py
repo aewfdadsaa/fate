@@ -24,7 +24,7 @@ MAX_DELETES_PER_MIN = 3     # max. geloeschte Channels/Rollen pro 60 Sek.
 PING_LIMIT = 3              # so viele @everyone/@here hintereinander loesen aus
 PING_WINDOW = 60            # ...innerhalb dieser Sekunden
 KICK_UNKNOWN_BOTS = True    # Bots, die nicht vom OWNER_ID hinzugefuegt wurden, werden gekickt
-AUTO_RESTORE_ON_JOIN = True # Rollen automatisch zurueckgeben wenn jemand neu joint
+AUTO_RESTORE_ON_JOIN = False # False = Rollen kommen beim Rejoin NUR per ,restore zurueck
 
 whitelists = {}
 snapped = {}
@@ -206,6 +206,7 @@ def save_x7():
 # =========================
 
 LOG_CHANNEL_ID = 1553512690155130900
+LOCKDOWN_PING_ROLE_ID = 1538721709798981687  # diese Rolle soll bei Lockdown gepingt werden
 ACTION_LOG_FILE = "actionlog.json"
 action_log = jload(ACTION_LOG_FILE, {})  # "guild:user:kind" -> [timestamps]
 
@@ -250,7 +251,9 @@ async def start_lockdown(guild, reason="manual"):
         channel = await guild.create_text_channel("lockdown", overwrites=overwrites, reason="Antinuke lockdown")
         lockdown_state[gid]["channel"] = channel.id
         save_lockdown()
-        await channel.send("server is currently on lockdown")
+        ping_role = guild.get_role(LOCKDOWN_PING_ROLE_ID)
+        mention = ping_role.mention if ping_role else f"<@&{LOCKDOWN_PING_ROLE_ID}>"
+        await channel.send(f"server currently on lockdown, ping someone with this role: {mention}")
     except discord.HTTPException:
         pass
 
@@ -276,7 +279,19 @@ async def start_lockdown(guild, reason="manual"):
     save_lockdown()
     await send_log(guild, f"🔒 Lockdown active — roles removed from {count} members.")
 
+lockdown_ending = set()  # Server, bei denen gerade ein Lockdown beendet wird
+
 async def end_lockdown(guild):
+    """Beendet den Lockdown. Gibt 'busy' zurueck, wenn schon ein Beenden laeuft."""
+    if guild.id in lockdown_ending:
+        return "busy"
+    lockdown_ending.add(guild.id)
+    try:
+        return await _end_lockdown(guild)
+    finally:
+        lockdown_ending.discard(guild.id)
+
+async def _end_lockdown(guild):
     state = lockdown_state.get(guild.id)
     if not state:
         return None
@@ -294,9 +309,9 @@ async def end_lockdown(guild):
                 restored += 1
             except discord.HTTPException:
                 pass
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.1)
     channel = guild.get_channel(state.get("channel") or 0)
-    del lockdown_state[guild.id]
+    lockdown_state.pop(guild.id, None)
     save_lockdown()
     if channel:
         try:
@@ -647,8 +662,12 @@ async def lockdown_cmd(ctx, mode: str = None):
         if gid not in lockdown_state:
             return await ctx.send("Server is not on lockdown.")
         lock_channel_id = lockdown_state[gid].get("channel")
-        await ctx.send("Lifting lockdown and restoring roles...")
+        if gid in lockdown_ending:
+            return await ctx.send("Already lifting the lockdown, please wait...")
+        await ctx.send("Lifting lockdown and restoring roles... (this can take a minute, don't send the command again)")
         restored = await end_lockdown(ctx.guild)
+        if restored == "busy" or restored is None:
+            return
         if ctx.channel.id != lock_channel_id:
             await ctx.send(f"Lockdown lifted. Roles restored for {restored} members.")
         await send_log(ctx.guild, f"🔓 Lockdown lifted by {ctx.author}. Roles restored for {restored} members.")
