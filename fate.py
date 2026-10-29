@@ -402,12 +402,65 @@ async def on_audit_log_entry_create(entry):
             except discord.HTTPException:
                 pass
 
+# =========================
+# CLEAN MODE
+# =========================
+
+CLEAN_ROLE_ID = 1538721709798981687  # mindestens diese Rolle (oder hoeher) darf im Clean Mode schreiben
+CLEAN_FILE = "clean.json"
+clean_channels = set(jload(CLEAN_FILE, []))  # channel_ids mit aktivem Clean Mode
+
+def save_clean():
+    jsave(CLEAN_FILE, list(clean_channels))
+
+def clean_blocked(message):
+    """True = Nachricht soll im Clean Mode geloescht werden."""
+    if message.guild is None or message.channel.id not in clean_channels:
+        return False
+    if message.author.bot:
+        return False
+    if message.author.id == OWNER_ID or is_whitelisted(message.guild.id, message.author.id):
+        return False
+    role = message.guild.get_role(CLEAN_ROLE_ID)
+    if role is None:
+        return False  # Rolle existiert nicht -> nichts erzwingen
+    return message.author.top_role < role
+
+@bot.command(name="clean")
+@commands.check(wlcheck)
+async def clean_cmd(ctx, mode: str = None):
+    """,clean -> Clean Mode in diesem Channel an.  ,clean off -> aus."""
+    mode = (mode or "").lower()
+    cid = ctx.channel.id
+
+    if mode == "":
+        clean_channels.add(cid)
+        save_clean()
+        return await ctx.send("clean mode enable")
+
+    if mode == "off":
+        if cid not in clean_channels:
+            return await ctx.send("Clean mode is not enabled in this channel.")
+        clean_channels.discard(cid)
+        save_clean()
+        return await ctx.send("clean mode disable")
+
+    await ctx.send("Use `,clean` or `,clean off`.")
+
 # --- @everyone / @here Spam ---
 
 ping_tracker = {}  # channel_id -> [(timestamp, message)]
 
 @bot.event
 async def on_message(message):
+    # Clean Mode: Nachrichten von Leuten ohne die Mindest-Rolle loeschen
+    if clean_blocked(message):
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass
+        return
+
     if (
         message.guild
         and message.author.id not in (OWNER_ID, bot.user.id)
@@ -981,137 +1034,161 @@ async def nuke(ctx):
 # GIVEAWAY SYSTEM
 # =========================
 
-last_gw_message = {}  # guild_id : message_id
+GW_EMOJI = "✅"
+GIVEAWAY_FILE = "giveaways.json"
+# str(message_id) -> {"item", "host", "channel", "entries", "ended_ts",
+#                     "winners", "drawn", "slots"}
+giveaways = jload(GIVEAWAY_FILE, {})
 
-@bot.command()
-@commands.check(wlcheck)
-async def gw(ctx, item: str, time: str):
+def save_giveaways():
+    jsave(GIVEAWAY_FILE, giveaways)
 
-    if not (is_gw_whitelisted(ctx.guild.id, ctx.author.id) or is_whitelisted(ctx.guild.id, ctx.author.id)):
-        return await ctx.send("You are not allowed to start giveaways.")
+def parse_duration(text):
+    """'30m', '1h', '2d', '45s' -> Sekunden (oder None bei ungueltigem Format)."""
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    text = text.lower()
+    if len(text) < 2 or text[-1] not in units or not text[:-1].isdigit():
+        return None
+    value = int(text[:-1])
+    return value * units[text[-1]] if value > 0 else None
 
-    # Convert time (e.g. "1h", "30m")
-    seconds = None
-    if time.endswith("h"):
-        try:
-            seconds = int(time[:-1]) * 3600
-        except:
-            return await ctx.send("Invalid time format. Example: 1h / 30m")
-    elif time.endswith("m"):
-        try:
-            seconds = int(time[:-1]) * 60
-        except:
-            return await ctx.send("Invalid time format. Example: 1h / 30m")
-    else:
-        return await ctx.send("Time must end with 'h' or 'm'. Example: 1h / 30m")
+async def collect_entrants(msg):
+    users = []
+    for reaction in msg.reactions:
+        if str(reaction.emoji) == GW_EMOJI:
+            async for user in reaction.users():
+                if not user.bot and user not in users:
+                    users.append(user)
+    return users
 
-    embed = discord.Embed(
-        title=f"🎉 Giveaway: {item}",
+def running_embed(item, host, end_ts, winner_count):
+    return discord.Embed(
+        title=item,
         description=(
-            f"React with 🎉 to enter!\n\n"
-            f"**Prize:** {item}\n"
-            f"**Ends in:** {time}\n"
-            f"**Winner:** 1\n"
-            f"**Hosted by:** {ctx.author.mention}"
+            f"React with {GW_EMOJI} to enter the giveaway.\n"
+            f"**Ends:** <t:{end_ts}:R> (<t:{end_ts}:f>)\n"
+            f"**Winners:** {winner_count}\n"
+            f"**Hosted by:** {host.mention}"
         ),
         color=discord.Color.gold()
     )
-    embed.set_footer(text=f"Started at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
-    msg = await ctx.send(embed=embed)
-    await msg.add_reaction("🎉")
+def ended_embed(data):
+    ts = data["ended_ts"]
+    embed = discord.Embed(
+        title=data["item"],
+        description=(
+            f"React with {GW_EMOJI} to enter the giveaway.\n"
+            f"**Ended:** <t:{ts}:R> (<t:{ts}:f>)\n"
+            f"**Entries:** {data['entries']}\n"
+            f"**Hosted by:** <@{data['host']}>"
+        ),
+        color=discord.Color.dark_grey()
+    )
+    winners = ", ".join(f"<@{uid}>" for uid in data["winners"]) or "Nobody"
+    embed.add_field(name="Winners", value=winners, inline=False)
+    return embed
 
-    last_gw_message[ctx.guild.id] = msg.id
+@bot.command()
+@commands.check(wlcheck)
+async def gw(ctx, *args):
+    """,gw <Preis> <Zeit> <Gewinner>   z.B. ,gw Nitro 1h 2"""
+    usage = "Usage: `,gw <prize> <time> <winners>`  e.g. `,gw Nitro 1h 2`"
+
+    if len(args) < 3:
+        return await ctx.send(usage)
+
+    winners_raw = args[-1]
+    duration_raw = args[-2]
+    item = " ".join(args[:-2])
+
+    seconds = parse_duration(duration_raw)
+    if seconds is None:
+        return await ctx.send("Invalid time. Use s / m / h / d, e.g. `30m`, `1h`, `2d`.\n" + usage)
+
+    if not winners_raw.isdigit() or not (1 <= int(winners_raw) <= 20):
+        return await ctx.send("Winners must be a number between 1 and 20.\n" + usage)
+    winner_count = int(winners_raw)
+
+    end_ts = int((datetime.now(timezone.utc) + timedelta(seconds=seconds)).timestamp())
+
+    msg = await ctx.send(embed=running_embed(item, ctx.author, end_ts, winner_count))
+    await msg.add_reaction(GW_EMOJI)
 
     await asyncio.sleep(seconds)
 
-    msg = await ctx.channel.fetch_message(msg.id)
-    users = []
-
-    for reaction in msg.reactions:
-        if reaction.emoji == "🎉":
-            async for user in reaction.users():
-                if not user.bot:
-                    users.append(user)
-
-    if len(users) == 0:
-        return await ctx.send("Nobody entered the giveaway.")
-
-    winner = random.choice(users)
-
-    await ctx.send(f"🎉 **Giveaway Ended!** User {winner.mention} won the giveaway!")
-
-
-@bot.command()
-@commands.check(wlcheck)
-async def gw_reroll(ctx):
-
-    if not (is_gw_whitelisted(ctx.guild.id, ctx.author.id) or is_whitelisted(ctx.guild.id, ctx.author.id)):
-        return await ctx.send("You are not allowed to reroll giveaways.")
-
-    guild_id = ctx.guild.id
-
-    if guild_id not in last_gw_message:
-        return await ctx.send("There is no giveaway to reroll.")
-
     try:
-        msg = await ctx.channel.fetch_message(last_gw_message[guild_id])
-    except:
+        msg = await ctx.channel.fetch_message(msg.id)
+    except discord.HTTPException:
+        return await ctx.send("Giveaway message was deleted.")
+
+    users = await collect_entrants(msg)
+    winners = random.sample(users, min(winner_count, len(users)))
+
+    data = {
+        "item": item,
+        "host": ctx.author.id,
+        "channel": ctx.channel.id,
+        "entries": len(users),
+        "ended_ts": int(time.time()),
+        "winners": [w.id for w in winners],  # aktuelle Gewinner (Anzeige im Embed)
+        "drawn": [w.id for w in winners],    # alle, die schon gezogen wurden (fuer ,rr)
+        "slots": {},                         # Gewinner-Nachricht (id) -> User-ID
+    }
+    giveaways[str(msg.id)] = data
+
+    await msg.edit(embed=ended_embed(data))
+
+    if not winners:
+        save_giveaways()
+        return await ctx.send(f"Nobody entered the giveaway for **{item}**.")
+
+    # pro Gewinner eine eigene Nachricht
+    for w in winners:
+        m = await ctx.send(f"{w.mention} won the giveaway **{item}**!")
+        data["slots"][str(m.id)] = w.id
+    save_giveaways()
+
+@bot.command(name="rr")
+@commands.check(wlcheck)
+async def rr(ctx):
+    """Auf eine Gewinner-Nachricht antworten mit ,rr -> neue Nachricht mit einem anderen Gewinner."""
+    if not ctx.message.reference or not ctx.message.reference.message_id:
+        return await ctx.send("Reply to a winner message with `,rr`.")
+
+    winner_msg_id = str(ctx.message.reference.message_id)
+
+    # Giveaway finden, zu dem diese Gewinner-Nachricht gehoert
+    gw_id, data = None, None
+    for gid, d in giveaways.items():
+        if winner_msg_id in d.get("slots", {}):
+            gw_id, data = gid, d
+            break
+    if data is None:
+        return await ctx.send("That is not a winner message.")
+
+    channel = ctx.guild.get_channel(data["channel"]) or ctx.channel
+    try:
+        gw_msg = await channel.fetch_message(int(gw_id))
+    except discord.HTTPException:
         return await ctx.send("Could not find the giveaway message.")
 
-    users = []
+    users = await collect_entrants(gw_msg)
+    pool = [u for u in users if u.id not in data["drawn"]]
+    if not pool:
+        return await ctx.send("Nobody else entered, reroll not possible.")
 
-    for reaction in msg.reactions:
-        if reaction.emoji == "🎉":
-            async for user in reaction.users():
-                if not user.bot:
-                    users.append(user)
+    new_winner = random.choice(pool)
+    old_uid = data["slots"].pop(winner_msg_id)
 
-    if len(users) == 0:
-        return await ctx.send("Nobody entered the giveaway, reroll not possible.")
+    # alten Gewinner im Embed durch den neuen ersetzen
+    data["winners"] = [new_winner.id if uid == old_uid else uid for uid in data["winners"]]
+    data["drawn"].append(new_winner.id)
 
-    winner = random.choice(users)
+    new_msg = await ctx.send(f"{new_winner.mention} won the giveaway **{data['item']}**!")
+    data["slots"][str(new_msg.id)] = new_winner.id
+    save_giveaways()
 
-    await ctx.send(f"🔄 **Giveaway Reroll!** User {winner.mention} won the giveaway!")
-
-# =========================
-# GIVEAWAY WHITELIST SYSTEM
-# =========================
-
-gw_whitelist = {}  # guild_id : set(user_ids)
-
-def load_gw_whitelist(guild_id):
-    if guild_id not in gw_whitelist:
-        gw_whitelist[guild_id] = set()
-    return gw_whitelist[guild_id]
-
-def is_gw_whitelisted(guild_id, user_id):
-    return user_id in load_gw_whitelist(guild_id)
-
-@bot.command()
-@commands.check(wlcheck)
-async def gw_wl(ctx, action: str, member: discord.Member):
-    guild_id = ctx.guild.id
-    wl = load_gw_whitelist(guild_id)
-
-    action = action.lower()
-
-    if action == "add":
-        wl.add(member.id)
-        await ctx.send(f"{member.mention} has been added to the Giveaway Whitelist.")
-    elif action == "remove":
-        if member.id in wl:
-            wl.remove(member.id)
-            await ctx.send(f"{member.mention} has been removed from the Giveaway Whitelist.")
-        else:
-            await ctx.send("This user is not in the Giveaway Whitelist.")
-    else:
-        await ctx.send(
-            "Invalid action.\n"
-            "Use:\n"
-            "`,gw_wl add @user`\n"
-            "`,gw_wl remove @user`"
-        )
-
+    await gw_msg.edit(embed=ended_embed(data))
 
 bot.run(os.getenv("TOKEN"))
